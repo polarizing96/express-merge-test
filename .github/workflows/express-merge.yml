@@ -21,8 +21,9 @@ jobs:
     steps:
       - name: Cool-off period
         run: |
-          echo "Waiting 5 minutes cool-off period..."
-          sleep 300
+          DELAY="${{ vars.EXPRESS_MERGE_DELAY || '300' }}"
+          echo "Waiting ${DELAY}s cool-off period..."
+          sleep "$DELAY"
 
       - name: Express Merge Check
         uses: actions/github-script@v7
@@ -71,7 +72,7 @@ jobs:
               matchedType = 'skip-check';
               log('Type: skip-check (EXPRESS_MERGE_SKIP_CHECK=true)');
             } else {
-              const text = `${title} ${branch}`.toLowerCase();
+              const text = `${title} ${branch}`;
               for (const rule of safeRules) {
                 if (rule.pattern.test(text)) {
                   matchedType = rule.type;
@@ -116,7 +117,8 @@ jobs:
               owner, repo, issue_number: prNumber, labels: ['express-approved']
             }).catch(e => log(`WARN: label failed (${e.message})`));
 
-            // Approve
+            // Approve — note: GITHUB_TOKEN cannot approve PRs in the same repo by default.
+            // For production use, set EXPRESS_MERGE_TOKEN to a GitHub App token or PAT.
             log('Approving...');
             await github.rest.pulls.createReview({
               owner, repo, pull_number: prNumber,
