@@ -1,0 +1,127 @@
+# Express Merge — Auto-approve low-risk PRs
+#
+# Opt out: add "no-express-merge" label to any PR.
+
+name: Express Merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  express-merge:
+    runs-on: ubuntu-latest
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'no-express-merge')
+    steps:
+      - name: Cool-off period
+        run: |
+          echo "Waiting 5 minutes cool-off period..."
+          sleep 300
+
+      - name: Express Merge Check
+        uses: actions/github-script@v7
+        env:
+          EXPRESS_MERGE_ENABLED: ${{ vars.EXPRESS_MERGE_ENABLED || 'false' }}
+          EXPRESS_MERGE_MAX_LINES: ${{ vars.EXPRESS_MERGE_MAX_LINES || '50' }}
+          EXPRESS_MERGE_MAX_FILES: ${{ vars.EXPRESS_MERGE_MAX_FILES || '0' }}
+          EXPRESS_MERGE_SKIP_CHECK: ${{ vars.EXPRESS_MERGE_SKIP_CHECK || '' }}
+        with:
+          github-token: ${{ secrets.EXPRESS_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const log = (msg) => console.log(`[express-merge] ${msg}`);
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const title = context.payload.pull_request.title || '';
+            const branch = context.payload.pull_request.head.ref || '';
+            const enabled = process.env.EXPRESS_MERGE_ENABLED === 'true';
+            const skipCheck = process.env.EXPRESS_MERGE_SKIP_CHECK === 'true';
+            const maxLines = parseInt(process.env.EXPRESS_MERGE_MAX_LINES || '50');
+            const maxFiles = parseInt(process.env.EXPRESS_MERGE_MAX_FILES || '0');
+
+            log(`PR #${prNumber}: ${title}`);
+            log(`Mode: ${enabled ? 'LIVE' : 'DRY-RUN'}`);
+
+            // Re-check labels after cool-off
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.labels.some(l => l.name === 'no-express-merge')) {
+              log('SKIP — no-express-merge label.');
+              return;
+            }
+
+            // Classification rules (same as shared/rules.json)
+            const safeRules = [
+              { pattern: /renovate|dependabot|\bbump\b|\bdeps\b|upgrade.*\d+\.\d+|chore\(deps\)|docker.*(digest|tag)|\bversion\s+to\s+\d|\bto\s+v?\d+\.\d+|\bupdate\b.*(?:version|dependency|package|sdk)/i, type: 'version-bump' },
+              { pattern: /\brevert\b|\bcherry[- ]?pick\b/i, type: 'revert' },
+              { pattern: /\brelease\b|changesets|version bump|\bversion packages\b/i, type: 'release' },
+              { pattern: /\bdocs?\b|readme|changelog|codeowners|\bdocumentation\b|\bclaude\.md\b/i, type: 'docs' },
+              { pattern: /\btests?\b|\bspec\b|fixture|\bflaky\b|\be2e\b|\bplaywright\b/i, type: 'tests' },
+              { pattern: /\bformat\b|\bformatting\b|\breformat|\bspotless\b|\bprettier\b|\blint\b|\beslint\b|\bswiftlint\b|\bswiftformat\b|\btypos?\b|\bspelling\b/i, type: 'style' },
+              { pattern: /\balerts?\b|\bmonitoring\b|\blogging\b|\bdatadog\b|\bgrafana\b|\bsentry\b|\bobservability\b|\bmetrics?\b|\btelemetry\b|\btracking\b/i, type: 'observability' },
+            ];
+
+            // Classify
+            let matchedType = null;
+            if (skipCheck) {
+              matchedType = 'skip-check';
+              log('Type: skip-check (EXPRESS_MERGE_SKIP_CHECK=true)');
+            } else {
+              const text = `${title} ${branch}`.toLowerCase();
+              for (const rule of safeRules) {
+                if (rule.pattern.test(text)) {
+                  matchedType = rule.type;
+                  break;
+                }
+              }
+              if (!matchedType) {
+                log('SKIP — not a safe change type.');
+                return;
+              }
+              log(`Type: ${matchedType}`);
+            }
+
+            // Check diff size
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+            let adds = 0, dels = 0;
+            for (const f of files) { adds += f.additions || 0; dels += f.deletions || 0; }
+            const total = adds + dels;
+            log(`Diff: +${adds} -${dels} = ${total} lines, ${files.length} files`);
+
+            if (maxLines > 0 && total > maxLines) {
+              log(`SKIP — too many lines (${total} > ${maxLines}).`);
+              return;
+            }
+            if (maxFiles > 0 && files.length > maxFiles) {
+              log(`SKIP — too many files (${files.length} > ${maxFiles}).`);
+              return;
+            }
+
+            log(`ELIGIBLE — ${matchedType}, ${total} lines, ${files.length} files`);
+
+            if (!enabled) {
+              log('DRY-RUN — would auto-approve. Set EXPRESS_MERGE_ENABLED=true to go live.');
+              return;
+            }
+
+            // Label
+            log('Labeling...');
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: prNumber, labels: ['express-approved']
+            }).catch(e => log(`WARN: label failed (${e.message})`));
+
+            // Approve
+            log('Approving...');
+            await github.rest.pulls.createReview({
+              owner, repo, pull_number: prNumber,
+              event: 'APPROVE',
+              body: `Auto-approved by express-merge (${matchedType}, ${total} lines).`
+            }).catch(e => log(`WARN: approve failed (${e.message})`));
+
+            log(`DONE — #${prNumber} (${matchedType}) auto-approved.`);
